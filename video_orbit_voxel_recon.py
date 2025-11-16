@@ -938,7 +938,7 @@ def train_from_video(
         loss_tv = lambda_tv_sigma * loss_tv_sigma + lambda_tv_rgb * loss_tv_rgb
 
         # L1 Sparsity - penalizes total density to encourage empty space
-        lambda_l1 = 2e-2  # Sparsity weight (aggressive - fighting clouds hard)
+        lambda_l1 = 3e-2  # Sparsity weight (very aggressive for 128^3 resolution)
         loss_l1 = sigma_rec.mean()
 
         loss = loss_mse + loss_tv + lambda_l1 * loss_l1
@@ -1203,10 +1203,10 @@ if __name__ == "__main__":
         direction=direction,
         start_frame=start_frame,
         frame_step=1,          # Use every frame for better constraints
-        grid_size=32,
+        grid_size=128,         # High resolution: 128x128x128 voxels (2M+ voxels)
         img_res=(64,64),
         n_samples=64,
-        n_iters=2000,          # increased for neighbor growth to have time to expand
+        n_iters=4000,          # Doubled iterations for higher resolution and convergence
         scene_radius=1.5,
         fov_y_deg=45.0,
         out_dir="video_voxel_out",
