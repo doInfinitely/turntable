@@ -729,7 +729,7 @@ def train_from_video(
     orbit_period_frames,
     direction,
     start_frame=0,
-    frame_step=4,
+    frame_step=1,  # Use every frame (was 4)
     grid_size=32,
     img_res=(64,64),
     n_samples=64,
@@ -742,7 +742,13 @@ def train_from_video(
 ):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
+    print("=" * 60)
+    print(f"Using device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"CUDA version: {torch.version.cuda}")
+    print("=" * 60)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -923,8 +929,19 @@ def train_from_video(
         denom = mask.sum() * pred_stack.shape[1] + 1e-6  # *channels
         loss_mse = diff2.sum() / denom
 
-        # NO REGULARIZATION - test if photometric gradients exist at all
-        loss = loss_mse
+        # TV Smoothness regularization - encourages smooth surfaces
+        lambda_tv_sigma = 2e-3  # Smoothness on density
+        lambda_tv_rgb = 1e-3    # Smoothness on color
+
+        loss_tv_sigma = tv3d(sigma_rec)
+        loss_tv_rgb = tv3d(rgb_rec)
+        loss_tv = lambda_tv_sigma * loss_tv_sigma + lambda_tv_rgb * loss_tv_rgb
+
+        # L1 Sparsity - penalizes total density to encourage empty space
+        lambda_l1 = 2e-2  # Sparsity weight (aggressive - fighting clouds hard)
+        loss_l1 = sigma_rec.mean()
+
+        loss = loss_mse + loss_tv + lambda_l1 * loss_l1
 
         opt.zero_grad()
         loss.backward()
@@ -933,7 +950,7 @@ def train_from_video(
         if it % 10 == 0 or it == 0:
             print(
                 f"[{it}/{n_iters}] loss={loss.item():.6e} "
-                f"(mse={loss_mse.item():.6e}, {info_str})"
+                f"(mse={loss_mse.item():.6e}, tv={loss_tv.item():.6e}, l1={loss_l1.item():.6e}, {info_str})"
             )
 
         # Update live viewer
@@ -1185,7 +1202,7 @@ if __name__ == "__main__":
         orbit_period_frames=orbit_period_frames,
         direction=direction,
         start_frame=start_frame,
-        frame_step=4,          # tweak as you like
+        frame_step=1,          # Use every frame for better constraints
         grid_size=32,
         img_res=(64,64),
         n_samples=64,
