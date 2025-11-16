@@ -1,0 +1,11 @@
+# Requirements for Lambda GPU setup
+torch>=2.0.0
+torchvision
+numpy
+opencv-python
+pygame
+matplotlib
+pillow
+# PyTorch3D - install separately with:
+# pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
