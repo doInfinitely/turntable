@@ -30,24 +30,29 @@ def _candidate_affines(dx_range, dy_range, scales, angles, shears):
     return affines
 
 
-def _best_affine_for_window(win, img_next, x, y, affines, lambda_reg):
+def _best_affine_for_window(
+    win,
+    img_next,
+    x,
+    y,
+    affines,
+    reg_lambda=1e-4,
+    tie_eps=1e-9,
+):
     """
     For a given window in img1 (win), search in img2 with candidate affines.
 
-    We minimize:
-        score = MSE(patch, win) + lambda_reg * (dx^2 + dy^2)
-
-    Returns:
-      (best_err, best_params)
-        best_err    = unregularized MSE for the chosen candidate
-        best_params = (dx, dy, s, ang, sh, M) or None
+    Cost = MSE + reg_lambda * ||(dx,dy)||^2.
+    If costs are (near) ties, prefer the smaller ||(dx,dy)|| so
+    whitespace tends to get a null vector.
     """
     h, w = win.shape[:2]
     H2, W2 = img_next.shape[:2]
 
-    best_score = float("inf")
+    best_cost = float("inf")
     best_err = float("inf")
     best_params = None
+    best_norm2 = float("inf")
 
     for (dx, dy, s, ang, sh, M) in affines:
         patch = cv2.warpAffine(
@@ -55,7 +60,7 @@ def _best_affine_for_window(win, img_next, x, y, affines, lambda_reg):
             M,
             (W2, H2),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT
+            borderMode=cv2.BORDER_REFLECT,
         )
 
         patch_win = patch[y:y + h, x:x + w]
@@ -63,15 +68,23 @@ def _best_affine_for_window(win, img_next, x, y, affines, lambda_reg):
             continue
 
         diff = patch_win.astype(np.float32) - win.astype(np.float32)
-        err = np.mean(diff * diff)
+        mse = np.mean(diff * diff)
 
-        motion_sq = float(dx * dx + dy * dy)
-        score = err + lambda_reg * motion_sq
+        norm2 = dx * dx + dy * dy
+        cost = mse + reg_lambda * norm2
 
-        if score < best_score:
-            best_score = score
-            best_err = err
+        if cost < best_cost - tie_eps:
+            best_cost = cost
+            best_err = mse
             best_params = (dx, dy, s, ang, sh, M)
+            best_norm2 = norm2
+        elif abs(cost - best_cost) <= tie_eps:
+            # tie: prefer shorter motion vector
+            if norm2 < best_norm2:
+                best_cost = cost
+                best_err = mse
+                best_params = (dx, dy, s, ang, sh, M)
+                best_norm2 = norm2
 
     return best_err, best_params
 
@@ -85,7 +98,7 @@ def dense_motion_field(
     scales=None,
     angles=None,
     shears=None,
-    lambda_reg=1e-3,   # <--- soft regularization strength
+    reg_lambda=1e-4,
 ):
     """
     Compute a coarse dense affine-based motion field between img1 and img2.
@@ -97,11 +110,11 @@ def dense_motion_field(
     scales: list of scales to try
     angles: list of rotation angles (degrees)
     shears: list of shear values
-    lambda_reg: weight on motion magnitude penalty; small (1e-4–1e-3) recommended
+    reg_lambda: weight for ||(dx,dy)||^2 regularization.
 
     Returns:
       flow:   (Hc, Wc, 2)  with (dx, dy) per window
-      errors: (Hc, Wc)     best match MSE per window (UNregularized)
+      errors: (Hc, Wc)     best match MSE per window
       affmats: Hc x Wc list of (dx,dy,s,ang,sh,M) or None
     """
     if scales is None:
@@ -129,7 +142,12 @@ def dense_motion_field(
             win = img1[y:y + window, x:x + window]
 
             best_err, params = _best_affine_for_window(
-                win, img2, x, y, affines, lambda_reg=lambda_reg
+                win,
+                img2,
+                x,
+                y,
+                affines,
+                reg_lambda=reg_lambda,
             )
 
             if params is None:
