@@ -28,11 +28,16 @@ sudo apt-get install -y \
 # Install Python packages
 echo "Installing Python packages..."
 pip install --upgrade pip
-pip install torch torchvision "numpy<2" opencv-python matplotlib pillow
+pip install torch torchvision "numpy<2" opencv-python matplotlib "pillow>=9.1.0" requests
 
 echo ""
 echo "Note: Using NumPy 1.x for compatibility with PyTorch"
 echo ""
+
+# Optional: Install OpenAI for background removal
+echo "Installing optional packages..."
+pip install "openai>=1.0.0"
+echo "✓ OpenAI installed (for background removal - requires API key)"
 
 # Optional: Install pygame and PyTorch3D for GPU-accelerated viewer
 # (Not needed for reconstruction, only for viewing)
@@ -71,6 +76,10 @@ echo "1. Upload reconstruction script: scp video_orbit_voxel_recon.py ubuntu@YOU
 echo "2. Upload your video: scp your_video.mp4 ubuntu@YOUR_IP:~/"
 echo "3. Run reconstruction: python3 video_orbit_voxel_recon.py your_video.mp4 0 --neighbor-growth"
 echo "4. Download results: scp ubuntu@YOUR_IP:~/video_voxel_out/recon_volume.npz ./"
+echo ""
+echo "Optional: Use OpenAI background removal for better quality"
+echo "  export OPENAI_API_KEY=your_key_here"
+echo "  python3 video_orbit_voxel_recon.py your_video.mp4 0 --openai-bg-removal"
 echo ""
 echo "The reconstruction will automatically use GPU and be ~10x faster!"
 

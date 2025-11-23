@@ -1,0 +1,21 @@
+{
+  "input": {
+    "type": "video_with_checkpoint",
+    "video_path": "hailuo_orbit.mp4",
+    "checkpoint_path": "video_voxel_out/recon_volume.npz"
+  },
+  "output": "continued_volume.npz",
+  "steps": [
+    {
+      "type": "reconstruct",
+      "params": {
+        "start_frame": 0,
+        "n_iters": 4000,
+        "img_res": [256, 256],
+        "lambda_l1": 0.02,
+        "lambda_tv_sigma": 0.003
+      }
+    }
+  ]
+}
+

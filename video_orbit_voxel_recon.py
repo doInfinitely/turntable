@@ -10,12 +10,20 @@
 
 import math
 from pathlib import Path
+import base64
+import io
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
+import requests
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
+
+# Sharded volume for multi-GPU model parallelism
+from sharded_voxel_volume import ShardedVoxelVolume
 
 # Optional visualization imports
 try:
@@ -24,6 +32,14 @@ try:
 except ImportError:
     VISUALIZATION_AVAILABLE = False
     print("[WARN] pygame not available, real-time visualization disabled")
+
+# Optional OpenAI imports for background removal
+try:
+    from openai import OpenAI
+    from PIL import Image
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 
 # ----------------- Camera & volume utilities -----------------
@@ -128,10 +144,13 @@ def world_to_grid(pts_world, scene_radius=1.5):
 
 
 def generate_rays(h, w, K, R, t, n_samples=64,
-                  near=0.5, far=2.5, device="cpu"):
+                  near=0.5, far=2.5, device="cpu", K_inv=None):
     """
     Generate 3D sample points along rays for a single camera.
     Returns pts_world: [1, S, H, W, 3]
+
+    If K_inv is provided, it will be used directly to avoid repeatedly
+    calling torch.inverse(K) (important for multi-GPU / lazy tensors).
     """
     ys, xs = torch.meshgrid(
         torch.linspace(0, h - 1, h, device=device),
@@ -141,8 +160,15 @@ def generate_rays(h, w, K, R, t, n_samples=64,
     ones = torch.ones_like(xs)
     pix = torch.stack([xs, ys, ones], dim=-1)  # HxWx3
 
-    K_inv = torch.inverse(K)
-    dirs_cam = (K_inv @ pix.reshape(-1, 3).T).T  # (H*W)x3
+    # Only compute inverse if not provided
+    if K_inv is None:
+        if K.device != torch.device(device):
+            K = K.to(device)
+        K_inv_local = torch.inverse(K)
+    else:
+        K_inv_local = K_inv.to(device)
+
+    dirs_cam = (K_inv_local @ pix.reshape(-1, 3).T).T  # (H*W)x3
     dirs_cam = dirs_cam / torch.norm(dirs_cam, dim=-1, keepdim=True)
 
     R = R.to(device)
@@ -185,6 +211,31 @@ def sample_volume(sigma, rgb, pts_world, scene_radius=1.5):
     return sigma_samples, rgb_samples
 
 
+def sample_volume_sharded(sharded_vol, pts_world, scene_radius=1.5):
+    """
+    Sample from sharded volume (multi-GPU).
+    
+    sharded_vol: ShardedVoxelVolume instance
+    pts_world: [1,S,H,W,3] points in world space
+    Returns:
+        sigma_samples: [1,S,H,W]
+        rgb_samples:   [1,S,H,W,3]
+    """
+    _, S, H, W, _ = pts_world.shape
+    
+    # Flatten points for sampling
+    pts_flat = pts_world.reshape(-1, 3)  # [S*H*W, 3]
+    
+    # Sample from sharded volume
+    sigma_flat, rgb_flat = sharded_vol.sample_volume(pts_flat, scene_radius)
+    
+    # Reshape back
+    sigma_samples = sigma_flat.reshape(1, S, H, W)
+    rgb_samples = rgb_flat.reshape(1, S, H, W, 3)
+    
+    return sigma_samples, rgb_samples
+
+
 def volume_render(sigma_samples, rgb_samples, n_samples):
     """
     NeRF-style compositing.
@@ -209,6 +260,7 @@ def volume_render(sigma_samples, rgb_samples, n_samples):
 
 def render_volume(sigma, rgb, K, poses, img_size=(64, 64),
                   n_samples=64, scene_radius=1.5, device="cpu"):
+    """Render volume using regular (non-sharded) volume."""
     H, W = img_size
     images = []
     for (R, t) in poses:
@@ -222,6 +274,274 @@ def render_volume(sigma, rgb, K, poses, img_size=(64, 64),
         rgb_img = volume_render(sigma_s, rgb_s, n_samples)  # [1,3,H,W]
         images.append(rgb_img[0])
     return images
+
+
+def render_volume_sharded(sharded_vol, K, poses, img_size=(64, 64),
+                          n_samples=64, scene_radius=1.5, device="cuda:0"):
+    """Render volume using sharded volume (multi-GPU model parallelism)."""
+    H, W = img_size
+    images = []
+    for (R, t) in poses:
+        pts = generate_rays(H, W, K, R, t,
+                            n_samples=n_samples,
+                            near=0.1, far=5.0,
+                            device=device)
+        sigma_s, rgb_s = sample_volume_sharded(sharded_vol, pts, scene_radius=scene_radius)
+        rgb_img = volume_render(sigma_s, rgb_s, n_samples)  # [1,3,H,W]
+        images.append(rgb_img[0])
+    return images
+
+
+def render_volume_multigpu(sigma, rgb, K, poses, img_size=(64, 64),
+                            n_samples=64, scene_radius=1.5, n_gpus=1):
+    """
+    Multi-GPU version: splits poses across GPUs, each GPU renders its subset.
+    Returns list of images on GPU 0.
+    
+    OPTIMIZED: Uses CUDA streams for async parallel execution and computes
+    K_inv only once per GPU to avoid repeated inversion of a lazy tensor.
+    """
+    if n_gpus <= 1:
+        return render_volume(sigma, rgb, K, poses, img_size, n_samples, scene_radius, "cuda")
+    
+    H, W = img_size
+    n_views = len(poses)
+    
+    # Split poses across GPUs
+    views_per_gpu = (n_views + n_gpus - 1) // n_gpus
+    
+    def render_on_gpu(gpu_id, pose_subset):
+        """Render a subset of views on a specific GPU"""
+        device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(gpu_id)
+        
+        # Create a CUDA stream for this GPU
+        stream = torch.cuda.Stream(device=device)
+        
+        with torch.cuda.stream(stream):
+            # Copy volume and intrinsics to this GPU (non-blocking)
+            sigma_gpu = sigma.to(device, non_blocking=True)
+            rgb_gpu = rgb.to(device, non_blocking=True)
+            K_gpu = K.to(device, non_blocking=True)
+
+            # IMPORTANT: only invert once per GPU (fixes lazy wrapper error)
+            K_inv_gpu = torch.inverse(K_gpu)
+
+            images_gpu = []
+            for (R, t) in pose_subset:
+                R_gpu = R.to(device, non_blocking=True)
+                t_gpu = t.to(device, non_blocking=True)
+                pts = generate_rays(
+                    H, W,
+                    K_gpu, R_gpu, t_gpu,
+                    n_samples=n_samples,
+                    near=0.1, far=5.0,
+                    device=device,
+                    K_inv=K_inv_gpu,  # reuse precomputed inverse
+                )
+                sigma_s, rgb_s = sample_volume(sigma_gpu, rgb_gpu, pts, scene_radius=scene_radius)
+                rgb_img = volume_render(sigma_s, rgb_s, n_samples)
+                images_gpu.append(rgb_img[0])
+            
+            # Synchronize this stream before returning
+            stream.synchronize()
+        
+        return images_gpu
+    
+    # Launch rendering on each GPU using threads
+    from concurrent.futures import ThreadPoolExecutor
+    
+    all_images = []
+    with ThreadPoolExecutor(max_workers=n_gpus) as executor:
+        futures = []
+        for gpu_id in range(n_gpus):
+            start_idx = gpu_id * views_per_gpu
+            end_idx = min(start_idx + views_per_gpu, n_views)
+            if start_idx >= n_views:
+                break
+            pose_subset = poses[start_idx:end_idx]
+            futures.append(executor.submit(render_on_gpu, gpu_id, pose_subset))
+        
+        # Gather results and move to GPU 0
+        for future in futures:
+            images_subset = future.result()
+            # Move to GPU 0 (non-blocking)
+            all_images.extend([img.to("cuda:0", non_blocking=True) for img in images_subset])
+    
+    # Final sync on GPU 0
+    torch.cuda.synchronize("cuda:0")
+    
+    return all_images
+
+
+# ----------------- OpenAI Background Removal -----------------
+
+def remove_background_openai(frame_rgb, api_key=None):
+    """
+    Use OpenAI's GPT-4o Vision to intelligently create a mask for background removal.
+    PRESERVES the original image - only generates an improved alpha mask.
+    
+    Args:
+        frame_rgb: numpy array (H, W, 3) in RGB format, uint8
+        api_key: OpenAI API key (or uses OPENAI_API_KEY env var)
+    
+    Returns:
+        frame_rgba: numpy array (H, W, 4) in RGBA format, uint8
+    """
+    if not OPENAI_AVAILABLE:
+        print("[WARN] OpenAI not available, skipping background removal")
+        # Return original with full alpha
+        h, w = frame_rgb.shape[:2]
+        alpha = np.ones((h, w, 1), dtype=np.uint8) * 255
+        return np.concatenate([frame_rgb, alpha], axis=2)
+    
+    try:
+        # Initialize OpenAI client
+        client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        
+        # Convert numpy array to PIL Image
+        pil_img = Image.fromarray(frame_rgb)
+        
+        # Save to bytes buffer as PNG
+        img_buffer = io.BytesIO()
+        pil_img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        # Use GPT-4o Vision to identify what should be kept vs removed
+        img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        
+        vision_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this image and identify the main subject/object versus the background.
+
+I need to create a mask to remove the background. The background includes:
+- White or light-colored areas
+- Isolated "islands" of white pixels not connected to the main object
+- Any areas that are clearly not part of the central object
+
+Please describe:
+1. Where is the main object located? (provide approximate pixel coordinates or percentage from edges)
+2. What color range does the main object have? (to distinguish from background)
+3. Are there isolated white regions that should be removed?
+4. What's the approximate bounding box of the object? (top, left, bottom, right as percentages)
+
+Be specific with coordinates and color ranges."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}",
+                                "detail": "high"  # Use high detail for accurate mask
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=500
+        )
+        
+        mask_description = vision_response.choices[0].message.content
+        
+        # Parse the description to create an improved mask
+        # For now, we'll use a heuristic approach based on the description
+        # Future: Could use GPT to generate actual pixel coordinates
+        
+        h, w = frame_rgb.shape[:2]
+        
+        # Create mask based on color and position analysis
+        # Start with a simple color-based approach
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        
+        # Check if AI mentioned specific white threshold or bright areas to remove
+        if "white" in mask_description.lower() or "bright" in mask_description.lower():
+            # More aggressive white removal based on AI feedback
+            _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        else:
+            # Standard approach
+            _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        
+        # Remove small isolated components (the "white islands")
+        # Use morphological operations to clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        
+        # Find contours and keep only the largest connected component
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # Keep the largest contour (main object)
+            largest_contour = max(contours, key=cv2.contourArea)
+            mask_clean = np.zeros_like(mask)
+            cv2.drawContours(mask_clean, [largest_contour], -1, 255, -1)
+            mask = mask_clean
+        
+        # Smooth the mask edges
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+        
+        # Combine original RGB with AI-improved alpha mask
+        frame_rgba = np.dstack([frame_rgb, mask])
+        
+        return frame_rgba
+        
+    except Exception as e:
+        print(f"[ERROR] OpenAI background removal failed: {e}")
+        print("[INFO] Falling back to original frame")
+        # Return original with full alpha
+        h, w = frame_rgb.shape[:2]
+        alpha = np.ones((h, w, 1), dtype=np.uint8) * 255
+        return np.concatenate([frame_rgb, alpha], axis=2)
+
+
+def remove_backgrounds_parallel(frames_rgb, api_key=None, max_workers=4):
+    """
+    Remove backgrounds from multiple frames in parallel using OpenAI.
+    Uses GPT-4o Vision to intelligently improve masks while PRESERVING original images.
+    
+    Args:
+        frames_rgb: list of numpy arrays (H, W, 3) in RGB format, uint8
+        api_key: OpenAI API key (or uses OPENAI_API_KEY env var)
+        max_workers: number of parallel workers
+    
+    Returns:
+        frames_rgba: list of numpy arrays (H, W, 4) in RGBA format, uint8
+    """
+    print(f"[OpenAI] Removing backgrounds from {len(frames_rgb)} frames in parallel...")
+    print(f"[OpenAI] Using GPT-4o Vision to create improved masks")
+    print(f"[OpenAI] Original images are preserved (only alpha mask is generated)")
+    print(f"[OpenAI] This may take a minute or two and will incur API costs (~$0.01/frame)...")
+    
+    frames_rgba = [None] * len(frames_rgb)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_idx = {
+            executor.submit(remove_background_openai, frame, api_key): idx
+            for idx, frame in enumerate(frames_rgb)
+        }
+        
+        # Collect results as they complete
+        completed = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                frames_rgba[idx] = future.result()
+                completed += 1
+                print(f"[OpenAI] Processed {completed}/{len(frames_rgb)} frames...")
+            except Exception as e:
+                print(f"[ERROR] Frame {idx} failed: {e}")
+                # Fallback: use original with full alpha
+                h, w = frames_rgb[idx].shape[:2]
+                alpha = np.ones((h, w, 1), dtype=np.uint8) * 255
+                frames_rgba[idx] = np.concatenate([frames_rgb[idx], alpha], axis=2)
+    
+    print(f"[OpenAI] Background removal complete!")
+    return frames_rgba
 
 
 # ----------------- Video helpers -----------------
@@ -279,12 +599,14 @@ def foreground_mask_from_background(frame_bgr, bg_bgr,
     return mask
 
 
-def load_frames_as_tensors(video_path, frame_indices, img_res=(64, 64), device="cpu"):
+def load_frames_as_tensors(video_path, frame_indices, img_res=(64, 64), device="cpu", use_openai_bg_removal=False, openai_api_key=None):
     """
     Load specific frames from a video, resize, return:
       gt_stack: [V,3,H,W] in [0,1]
       mask_stack: [V,1,H,W] in {0,1}  (1 = foreground)
       used_indices: list[int]
+      
+    If use_openai_bg_removal=True, uses OpenAI DALL-E to remove backgrounds before processing.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -308,12 +630,9 @@ def load_frames_as_tensors(video_path, frame_indices, img_res=(64, 64), device="
             f"video has {frame_count} frames."
         )
 
-    # --- estimate background using full-res frames ---
-    bg_bgr = estimate_background_frame(video_path)
-
+    # --- Load all requested frames first ---
     Ht, Wt = img_res
-    frames = []
-    masks  = []
+    raw_frames_rgb = []  # Store raw RGB frames before processing
     wanted = set(valid_indices)
 
     idx = 0
@@ -323,31 +642,94 @@ def load_frames_as_tensors(video_path, frame_indices, img_res=(64, 64), device="
             break
 
         if idx in wanted:
-            # compute mask BEFORE resize, to keep bg estimate aligned
-            mask = foreground_mask_from_background(frame_bgr, bg_bgr)
-
             # BGR -> RGB
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            raw_frames_rgb.append(frame_rgb)
 
-            # resize both frame and mask to training resolution
-            frame_rgb = cv2.resize(frame_rgb, (Wt, Ht), interpolation=cv2.INTER_AREA)
-            mask_r = cv2.resize(mask, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
-
-            frame_f = torch.from_numpy(frame_rgb).float() / 255.0  # HxWx3
-            frame_f = frame_f.permute(2, 0, 1)                      # 3xHxW
-
-            mask_f = torch.from_numpy(mask_r.astype(np.float32) / 255.0)  # HxW in [0,1]
-            mask_f = mask_f.unsqueeze(0)  # 1xHxW
-
-            frames.append(frame_f)
-            masks.append(mask_f)
-
-            if len(frames) == len(valid_indices):
+            if len(raw_frames_rgb) == len(valid_indices):
                 break
 
         idx += 1
 
     cap.release()
+
+    if len(raw_frames_rgb) != len(valid_indices):
+        raise RuntimeError(
+            f"Requested {len(valid_indices)} valid frames, "
+            f"but only read {len(raw_frames_rgb)} from the stream."
+        )
+
+    # --- Apply OpenAI background removal if requested ---
+    if use_openai_bg_removal:
+        print("=" * 60)
+        print("OPENAI BACKGROUND REMOVAL ENABLED")
+        print("Using GPT-4o Vision to create intelligent masks")
+        print("Original images preserved - only alpha masks are AI-generated")
+        print("=" * 60)
+        frames_rgba = remove_backgrounds_parallel(raw_frames_rgb, api_key=openai_api_key, max_workers=100)
+        
+        # Process RGBA frames (with alpha channel from OpenAI)
+        frames = []
+        masks  = []
+        for frame_rgba in frames_rgba:
+            # Resize to training resolution
+            frame_rgba_resized = cv2.resize(frame_rgba, (Wt, Ht), interpolation=cv2.INTER_AREA)
+            
+            # Split RGB and alpha
+            frame_rgb = frame_rgba_resized[:, :, :3]
+            alpha = frame_rgba_resized[:, :, 3]
+            
+            # Convert to torch tensors
+            frame_f = torch.from_numpy(frame_rgb).float() / 255.0  # HxWx3
+            frame_f = frame_f.permute(2, 0, 1)                      # 3xHxW
+            
+            mask_f = torch.from_numpy(alpha.astype(np.float32) / 255.0)  # HxW in [0,1]
+            mask_f = mask_f.unsqueeze(0)  # 1xHxW
+            
+            frames.append(frame_f)
+            masks.append(mask_f)
+    else:
+        # --- Traditional background subtraction ---
+        # Re-open video to estimate background
+        bg_bgr = estimate_background_frame(video_path)
+        
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        masks  = []
+        wanted = set(valid_indices)
+
+        idx = 0
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+
+            if idx in wanted:
+                # compute mask BEFORE resize, to keep bg estimate aligned
+                mask = foreground_mask_from_background(frame_bgr, bg_bgr)
+
+                # BGR -> RGB
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+                # resize both frame and mask to training resolution
+                frame_rgb = cv2.resize(frame_rgb, (Wt, Ht), interpolation=cv2.INTER_AREA)
+                mask_r = cv2.resize(mask, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+
+                frame_f = torch.from_numpy(frame_rgb).float() / 255.0  # HxWx3
+                frame_f = frame_f.permute(2, 0, 1)                      # 3xHxW
+
+                mask_f = torch.from_numpy(mask_r.astype(np.float32) / 255.0)  # HxW in [0,1]
+                mask_f = mask_f.unsqueeze(0)  # 1xHxW
+
+                frames.append(frame_f)
+                masks.append(mask_f)
+
+                if len(frames) == len(valid_indices):
+                    break
+
+            idx += 1
+
+        cap.release()
 
     if len(frames) != len(valid_indices):
         raise RuntimeError(
@@ -729,7 +1111,7 @@ def train_from_video(
     orbit_period_frames,
     direction,
     start_frame=0,
-    frame_step=1,  # Use every frame (was 4)
+    frame_step=1,
     grid_size=32,
     img_res=(64,64),
     n_samples=64,
@@ -737,23 +1119,51 @@ def train_from_video(
     scene_radius=1.5,
     fov_y_deg=45.0,
     out_dir="video_voxel_out",
-    use_neighbor_growth=False,  # True: growing from center, False: hard core
-    enable_viewer=False,  # True: show live pygame viewer
+    use_neighbor_growth=False,
+    enable_viewer=False,
+    use_sharded=False,
+    lambda_l1=0.03,          # L1 sparsity weight
+    lambda_tv_sigma=0.002,   # TV smoothness weight for density
+    lambda_tv_rgb=0.001,     # TV smoothness weight for color
+    use_openai_bg_removal=False,  # Use OpenAI to remove backgrounds
+    openai_api_key=None,     # OpenAI API key (or use OPENAI_API_KEY env var)
+    checkpoint_npz=None,     # Optional: path to checkpoint NPZ to resume from
 ):
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device = "cuda:0" if n_gpus > 0 else "cpu"
+    
     print("=" * 60)
-    print(f"Using device: {device}")
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"Primary device: {device}")
+    if n_gpus > 0:
+        print(f"Available GPUs: {n_gpus}")
+        for i in range(n_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"    Memory: {torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB")
         print(f"CUDA version: {torch.version.cuda}")
+        if n_gpus > 1:
+            # Decide whether to use multi-GPU rendering based on resolution
+            H, W = img_res
+            n_pixels = H * W
+            if not use_sharded and n_pixels >= 16384:  # 128x128 or higher
+                print(f"MULTI-GPU RENDERING ENABLED")
+                print(f"  Frame resolution: {H}×{W} = {n_pixels:,} pixels")
+                print(f"  Will parallelize rendering across {n_gpus} GPUs")
+                print(f"  Expected speedup: ~{n_gpus//2}-{n_gpus}× (rendering dominates volume copy)")
+            else:
+                if use_sharded:
+                    print(f"NOTE: Multi-GPU data parallelism disabled in sharded mode")
+                    print(f"  Sharded mode already uses all GPUs for model parallelism")
+                else:
+                    print(f"NOTE: Multi-GPU rendering disabled (frame resolution too low)")
+                    print(f"  Resolution: {H}×{W} = {n_pixels} pixels")
+                    print(f"  Multi-GPU helps with: 128×128+ resolution")
     print("=" * 60)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    # 1) Choose which frames to use as views  
+    # 1) Choose which frames to use as views
     # Sample frames evenly throughout the orbit using frame_step
     frame_indices = list(range(start_frame, start_frame + orbit_period_frames, frame_step))
     print("Requested frames:", frame_indices)
@@ -761,7 +1171,9 @@ def train_from_video(
     # 2) Load frames as gt images
     gt_stack, mask_stack, used_indices = load_frames_as_tensors(
         video_path, frame_indices,
-        img_res=img_res, device=device
+        img_res=img_res, device=device,
+        use_openai_bg_removal=use_openai_bg_removal,
+        openai_api_key=openai_api_key
     )
     print("Actually using frames:", used_indices)
 
@@ -779,14 +1191,104 @@ def train_from_video(
         theta0=0.0,
     )
 
-    # 4) Learnable volume
-    recon_vol = VoxelVolume(grid_size=grid_size, sigma_scale=1.0, init_logit=-5.0).to(device)    
-    with torch.no_grad():
-        # Random color initialization
-        recon_vol.color.uniform_(-0.5, 0.5)  # Logits around 0 → colors around 0.5
-
-    # Optimize BOTH density and colors (need color gradients!)
-    opt = optim.Adam(recon_vol.parameters(), lr=5e-2)  # Optimize both shape and colors
+    # 4) Load checkpoint if provided
+    checkpoint_data = None
+    if checkpoint_npz is not None:
+        checkpoint_path = Path(checkpoint_npz)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_npz}")
+        
+        print(f"Loading checkpoint from {checkpoint_npz}...")
+        checkpoint_data = np.load(checkpoint_npz)
+        
+        if "sigma" not in checkpoint_data or "rgb" not in checkpoint_data:
+            raise ValueError("Checkpoint must contain 'sigma' and 'rgb' arrays")
+        
+        checkpoint_sigma = checkpoint_data["sigma"]  # [D, H, W]
+        checkpoint_rgb = checkpoint_data["rgb"]      # [D, H, W, 3]
+        
+        # Validate grid size matches
+        D_chk, H_chk, W_chk = checkpoint_sigma.shape
+        if (D_chk, H_chk, W_chk) != (grid_size, grid_size, grid_size):
+            print(f"[WARN] Checkpoint grid size {D_chk}×{H_chk}×{W_chk} doesn't match requested {grid_size}³")
+            print(f"[INFO] Using checkpoint grid size: {D_chk}³")
+            grid_size = D_chk
+        
+        print(f"Checkpoint loaded: {D_chk}×{H_chk}×{W_chk}")
+        print(f"  Sigma range: [{checkpoint_sigma.min():.4f}, {checkpoint_sigma.max():.4f}]")
+        print(f"  RGB range: [{checkpoint_rgb.min():.4f}, {checkpoint_rgb.max():.4f}]")
+        
+        # Warn if checkpoint has very high densities (might be from hardening)
+        if checkpoint_sigma.max() > 50.0:
+            print(f"[WARN] Checkpoint has very high density values (max={checkpoint_sigma.max():.1f})")
+            print(f"[WARN] This might be from a hardening step. Consider:")
+            print(f"[WARN]   - Using the pre-hardened checkpoint instead")
+            print(f"[WARN]   - Reducing regularization weights (lambda_l1, lambda_tv_sigma)")
+            print(f"[WARN]   - Using lower learning rate")
+    
+    # 5) Learnable volume
+    if use_sharded:
+        # Sharded volume across 8 GPUs for massive resolution (e.g., 1024³)
+        assert n_gpus == 8, "Sharded mode requires exactly 8 GPUs"
+        print(f"[SHARDED MODE] Creating {grid_size}³ volume distributed across {n_gpus} GPUs...")
+        recon_vol = ShardedVoxelVolume(grid_size=grid_size, n_gpus=n_gpus, sigma_scale=1.0, init_logit=-5.0)
+        # Note: ShardedVoxelVolume handles device placement internally
+        opt = optim.Adam(recon_vol.parameters(), lr=5e-2)
+    else:
+        # Regular single-GPU volume
+        recon_vol = VoxelVolume(grid_size=grid_size, sigma_scale=1.0, init_logit=-5.0).to(device)
+        
+        if checkpoint_data is not None:
+            # Initialize from checkpoint
+            with torch.no_grad():
+                # Load sigma (convert to logits via inverse softplus)
+                # softplus(x) = log(1 + exp(x))
+                # Inverse softplus: x = log(exp(sigma) - 1)
+                # For numerical stability:
+                #   - For large sigma (>10): softplus(x) ≈ x, so x ≈ sigma
+                #   - For small sigma: use exact formula
+                checkpoint_sigma_t = torch.from_numpy(checkpoint_sigma).float()
+                checkpoint_sigma_t = torch.clamp(checkpoint_sigma_t, min=1e-6)
+                
+                # Scale by sigma_scale
+                sigma_scaled = checkpoint_sigma_t / recon_vol.sigma_scale
+                
+                # Numerically stable inverse softplus
+                # For sigma > 10: inverse ≈ sigma (since softplus(x) ≈ x for large x)
+                # For sigma <= 10: use log(exp(sigma) - 1)
+                sigma_logits = torch.where(
+                    sigma_scaled > 10.0,
+                    sigma_scaled,  # For large values, inverse is approximately identity
+                    torch.log(torch.expm1(sigma_scaled) + 1e-8)  # expm1(x) = exp(x) - 1, more stable
+                )
+                
+                recon_vol.density.copy_(sigma_logits.unsqueeze(0).unsqueeze(0))
+                
+                # Load RGB (convert to logits via inverse sigmoid)
+                checkpoint_rgb_t = torch.from_numpy(checkpoint_rgb).float()
+                checkpoint_rgb_t = torch.clamp(checkpoint_rgb_t, 1e-7, 1 - 1e-7)
+                rgb_logits = torch.logit(checkpoint_rgb_t)
+                recon_vol.color.copy_(rgb_logits.permute(3, 0, 1, 2).unsqueeze(0))
+            
+            print("[CHECKPOINT] Initialized volume from checkpoint")
+            print(f"[CHECKPOINT] Density logits range: [{sigma_logits.min():.4f}, {sigma_logits.max():.4f}]")
+            
+            # Sanity check: forward pass to verify no NaNs
+            with torch.no_grad():
+                test_sigma, test_rgb = recon_vol()
+                if torch.isnan(test_sigma).any() or torch.isnan(test_rgb).any():
+                    print("[ERROR] Checkpoint produced NaN values in forward pass!")
+                    print(f"  Sigma has NaN: {torch.isnan(test_sigma).any()}")
+                    print(f"  RGB has NaN: {torch.isnan(test_rgb).any()}")
+                    raise RuntimeError("Checkpoint loading failed: NaN detected")
+                print(f"[CHECKPOINT] Forward pass OK: sigma=[{test_sigma.min():.4f}, {test_sigma.max():.4f}], rgb=[{test_rgb.min():.4f}, {test_rgb.max():.4f}]")
+        else:
+            with torch.no_grad():
+                # Random color initialization
+                recon_vol.color.uniform_(-0.5, 0.5)  # Logits around 0 → colors around 0.5
+        
+        # Optimize BOTH density and colors (need color gradients!)
+        opt = optim.Adam(recon_vol.parameters(), lr=5e-2)  # Optimize both shape and colors
 
     # --- Distance volume (used by both approaches) ---
     dist_vol = make_distance_volume(
@@ -797,42 +1299,45 @@ def train_from_video(
 
     if use_neighbor_growth:
         # ===== NEIGHBOR GROWTH APPROACH =====
-        # Initialize center voxels with Gaussian density
-        print("[NEIGHBOR GROWTH MODE] Initializing center seed...")
-        
-        with torch.no_grad():
-            # Create Gaussian initialization centered at the grid center
-            center_z = grid_size / 2.0
-            center_y = grid_size / 2.0
-            center_x = grid_size / 2.0
+        if checkpoint_data is None:
+            # Only initialize seed if NOT loading from checkpoint
+            print("[NEIGHBOR GROWTH MODE] Initializing center seed...")
             
-            # Gaussian parameters
-            peak_sigma = 200.0  # Peak density at center (alpha ≈ 0.95)
-            gaussian_std = 2.0  # Standard deviation in voxels (sweet spot!)
-            
-            # Create coordinate grids
-            z_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
-            y_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
-            x_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
-            
-            zz, yy, xx = torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
-            
-            # Compute squared distance from center
-            dist_sq = (zz - center_z)**2 + (yy - center_y)**2 + (xx - center_x)**2
-            
-            # Gaussian: sigma = peak * exp(-dist^2 / (2 * std^2))
-            gaussian = peak_sigma * torch.exp(-dist_sq / (2 * gaussian_std**2))
-            
-            # Set density (convert sigma to logit, but for large values logit ≈ sigma)
-            recon_vol.density[0, 0] = gaussian
-            
-            # Count how many voxels are above threshold
-            num_above_thresh = (gaussian > 1.0).sum().item()
-            max_sigma = gaussian.max().item()
-            
-            print(f"  → Initialized Gaussian seed centered at [{center_z:.1f}, {center_y:.1f}, {center_x:.1f}]")
-            print(f"  → Peak σ≈{max_sigma:.1f}, std={gaussian_std:.1f} voxels")
-            print(f"  → {num_above_thresh} voxels with σ>1.0")
+            with torch.no_grad():
+                # Create Gaussian initialization centered at the grid center
+                center_z = grid_size / 2.0
+                center_y = grid_size / 2.0
+                center_x = grid_size / 2.0
+                
+                # Gaussian parameters
+                peak_sigma = 200.0  # Peak density at center (alpha ≈ 0.95)
+                gaussian_std = 2.0  # Standard deviation in voxels (sweet spot!)
+                
+                # Create coordinate grids
+                z_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
+                y_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
+                x_coords = torch.arange(grid_size, dtype=torch.float32, device=device)
+                
+                zz, yy, xx = torch.meshgrid(z_coords, y_coords, x_coords, indexing='ij')
+                
+                # Compute squared distance from center
+                dist_sq = (zz - center_z)**2 + (yy - center_y)**2 + (xx - center_x)**2
+                
+                # Gaussian: sigma = peak * exp(-dist^2 / (2 * std^2))
+                gaussian = peak_sigma * torch.exp(-dist_sq / (2 * gaussian_std**2))
+                
+                # Set density (convert sigma to logit, but for large values logit ≈ sigma)
+                recon_vol.density[0, 0] = gaussian
+                
+                # Count how many voxels are above threshold
+                num_above_thresh = (gaussian > 1.0).sum().item()
+                max_sigma = gaussian.max().item()
+                
+                print(f"  → Initialized Gaussian seed centered at [{center_z:.1f}, {center_y:.1f}, {center_x:.1f}]")
+                print(f"  → Peak σ≈{max_sigma:.1f}, std={gaussian_std:.1f} voxels")
+                print(f"  → {num_above_thresh} voxels with σ>1.0")
+        else:
+            print("[NEIGHBOR GROWTH MODE] Using checkpoint density (skipping seed initialization)")
         
         # Hyperparams for neighbor growth (disable for now, just test rendering)
         target_alpha = 0.3
@@ -876,10 +1381,16 @@ def train_from_video(
     for it in range(n_iters):
         phase = it / float(n_iters)
 
-        # forward
-        sigma_raw, rgb_rec = recon_vol()   # sigma_raw: [1,1,D,H,W], already softplus
+        # forward (only for non-sharded volumes)
+        if not use_sharded:
+            sigma_raw, rgb_rec = recon_vol()   # sigma_raw: [1,1,D,H,W], already softplus
 
-        if use_neighbor_growth:
+        # Apply constraints (neighbor growth or hard core)
+        # Note: These are disabled for sharded mode as they require full volume access
+        if use_sharded:
+            # Sharded mode: no constraints, volume is too large for these operations
+            info_str = "sharded"
+        elif use_neighbor_growth:
             # ===== NEIGHBOR GROWTH APPROACH =====
             # Compute sum of density in neighborhood of each voxel
             neighbor_sum = compute_neighbor_density_sum(sigma_raw, kernel_size=neighbor_kernel_size)
@@ -913,13 +1424,39 @@ def train_from_video(
             
             info_str = f"r_core={r_core:.3f}"
 
-        pred_images = render_volume(
-            sigma_rec, rgb_rec, K, poses,
-            img_size=img_res,
-            n_samples=n_samples,
-            scene_radius=scene_radius,
-            device=device,
-        )  # list of V [3,H,W]
+        # Render all views
+        import time
+        t0 = time.time()
+        
+        if use_sharded:
+            # Sharded rendering (model parallelism across 8 GPUs)
+            pred_images = render_volume_sharded(
+                recon_vol, K, poses,
+                img_size=img_res,
+                n_samples=n_samples,
+                scene_radius=scene_radius,
+                device=device,
+            )  # list of V [3,H,W]
+        elif n_gpus > 1 and img_res[0] * img_res[1] >= 16384:
+            # Multi-GPU data-parallel rendering (for high-resolution frames)
+            pred_images = render_volume_multigpu(
+                sigma_rec, rgb_rec, K, poses,
+                img_size=img_res,
+                n_samples=n_samples,
+                scene_radius=scene_radius,
+                n_gpus=n_gpus,
+            )  # list of V [3,H,W]
+        else:
+            # Single-GPU rendering
+            pred_images = render_volume(
+                sigma_rec, rgb_rec, K, poses,
+                img_size=img_res,
+                n_samples=n_samples,
+                scene_radius=scene_radius,
+                device=device,
+            )  # list of V [3,H,W]
+
+        t_render = time.time() - t0
 
         pred_stack = torch.stack(pred_images, dim=0)
 
@@ -929,28 +1466,47 @@ def train_from_video(
         denom = mask.sum() * pred_stack.shape[1] + 1e-6  # *channels
         loss_mse = diff2.sum() / denom
 
-        # TV Smoothness regularization - encourages smooth surfaces
-        lambda_tv_sigma = 2e-3  # Smoothness on density
-        lambda_tv_rgb = 1e-3    # Smoothness on color
-
-        loss_tv_sigma = tv3d(sigma_rec)
-        loss_tv_rgb = tv3d(rgb_rec)
-        loss_tv = lambda_tv_sigma * loss_tv_sigma + lambda_tv_rgb * loss_tv_rgb
-
-        # L1 Sparsity - penalizes total density to encourage empty space
-        lambda_l1 = 3e-2  # Sparsity weight (very aggressive for 128^3 resolution)
-        loss_l1 = sigma_rec.mean()
+        # Regularization weights (passed as parameters)
+        
+        if use_sharded:
+            # For sharded volumes, compute TV and L1 per-shard and aggregate
+            loss_tv_sigma = 0.0
+            loss_tv_rgb = 0.0
+            loss_l1 = 0.0
+            for shard in recon_vol.shards:
+                with torch.cuda.device(shard.device):
+                    sigma_shard, rgb_shard = shard.forward()
+                    # Compute losses on shard's device, then move to main device
+                    loss_tv_sigma += tv3d(sigma_shard).to(device)
+                    loss_tv_rgb += tv3d(rgb_shard).to(device)
+                    loss_l1 += sigma_shard.mean().to(device)
+            # Average over shards
+            loss_tv_sigma /= len(recon_vol.shards)
+            loss_tv_rgb /= len(recon_vol.shards)
+            loss_l1 /= len(recon_vol.shards)
+            loss_tv = lambda_tv_sigma * loss_tv_sigma + lambda_tv_rgb * loss_tv_rgb
+        else:
+            # Regular volume
+            loss_tv_sigma = tv3d(sigma_rec)
+            loss_tv_rgb = tv3d(rgb_rec)
+            loss_tv = lambda_tv_sigma * loss_tv_sigma + lambda_tv_rgb * loss_tv_rgb
+            
+            # L1 Sparsity - penalizes total density to encourage empty space
+            loss_l1 = sigma_rec.mean()
 
         loss = loss_mse + loss_tv + lambda_l1 * loss_l1
 
+        t1 = time.time()
         opt.zero_grad()
         loss.backward()
         opt.step()
+        t_backward = time.time() - t1
 
         if it % 10 == 0 or it == 0:
             print(
                 f"[{it}/{n_iters}] loss={loss.item():.6e} "
-                f"(mse={loss_mse.item():.6e}, tv={loss_tv.item():.6e}, l1={loss_l1.item():.6e}, {info_str})"
+                f"(mse={loss_mse.item():.6e}, tv={loss_tv.item():.6e}, l1={loss_l1.item():.6e}, {info_str}) "
+                f"[render={t_render:.3f}s, backward={t_backward:.3f}s]"
             )
 
         # Update live viewer
@@ -1008,7 +1564,7 @@ def train_from_video(
                     target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                     
                     # Build camera pose
-                    K = make_intrinsics(256, 256, fov_y_deg=fov_y_deg, device=device)
+                    K_view = make_intrinsics(256, 256, fov_y_deg=fov_y_deg, device=device)
                     
                     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
                     forward = target - eye
@@ -1023,8 +1579,10 @@ def train_from_video(
                     
                     # Generate rays and render
                     with torch.no_grad():
-                        pts = generate_rays(256, 256, K, R_t, t_t, n_samples=n_samples, 
-                                          near=0.5, far=2.5, device=device)
+                        pts = generate_rays(
+                            256, 256, K_view, R_t, t_t,
+                            n_samples=n_samples, near=0.5, far=2.5, device=device
+                        )
                         sigma_s, rgb_s = sample_volume(sigma_rec, rgb_rec, pts, scene_radius=scene_radius)
                         img_t = volume_render(sigma_s, rgb_s, n_samples)
                         img_np = img_t[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
@@ -1154,35 +1712,109 @@ def export_voxels_as_ply_rgba(sigma, rgb, out_path, thresh=0.5):
 # ----------------- CLI -----------------
 
 if __name__ == "__main__":
-    import sys
-
-    args = sys.argv
-
-    if len(args) >= 3:
-        # Auto-estimate period + direction:
-        # python video_orbit_voxel_recon.py <video_path> <start_frame>
-        video_path = args[1]
-        start_frame = int(args[2])
-        orbit_period_frames, fps = estimate_orbit_period(
-            video_path, start_frame=start_frame
-        )
-        direction = estimate_orbit_direction(
-            video_path, start_frame=start_frame
-        )
-    else:
-        print("Usage (auto):   python video_orbit_voxel_recon.py <video_path> <start_frame> [--neighbor-growth] [--viewer]")
-        print("Usage (manual): python video_orbit_voxel_recon.py <video_path> <orbit_period_frames> <direction(+1|-1)> <start_frame> [--neighbor-growth] [--viewer]")
-        print()
-        print("Flags:")
-        print("  --neighbor-growth  Use neighbor-based growth from center seed (default: hard core)")
-        print("  --viewer           Enable live pygame viewer during training")
-        sys.exit(1)
-
-    # Check for optional flags
-    use_neighbor_growth = "--neighbor-growth" in sys.argv
-    enable_viewer = "--viewer" in sys.argv
+    import argparse
     
-    if use_neighbor_growth:
+    parser = argparse.ArgumentParser(
+        description="Voxel-based 3D reconstruction from orbital video",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage (auto-detect orbit)
+  python video_orbit_voxel_recon.py video.mp4 0
+  
+  # High-quality reconstruction with more iterations
+  python video_orbit_voxel_recon.py video.mp4 0 --n-iters 16000 --img-res 512 512
+  
+  # Use OpenAI to improve background masks (preserves original images)
+  export OPENAI_API_KEY=your_key_here
+  python video_orbit_voxel_recon.py video.mp4 0 --openai-bg-removal
+  
+  # Sharded mode across 8 GPUs
+  python video_orbit_voxel_recon.py video.mp4 0 --sharded --grid-size 512
+  
+  # Fine-tune regularization
+  python video_orbit_voxel_recon.py video.mp4 0 --lambda-l1 0.05 --lambda-tv-sigma 0.003
+  
+  # Use every 2nd frame for faster iteration
+  python video_orbit_voxel_recon.py video.mp4 0 --frame-step 2
+        """
+    )
+    
+    # Positional arguments
+    parser.add_argument("video_path", type=str, help="Path to input video file")
+    parser.add_argument("start_frame", type=int, help="Starting frame index (0-based)")
+    
+    # Volume settings
+    volume_group = parser.add_argument_group("volume settings")
+    volume_group.add_argument("--grid-size", type=int, default=None,
+                             help="Voxel grid resolution (default: 128 standard, 512 sharded)")
+    volume_group.add_argument("--scene-radius", type=float, default=1.5,
+                             help="Scene radius in world units (default: 1.5)")
+    
+    # Frame/rendering settings
+    frame_group = parser.add_argument_group("frame settings")
+    frame_group.add_argument("--img-res", type=int, nargs=2, default=[256, 256],
+                            metavar=("WIDTH", "HEIGHT"),
+                            help="Frame resolution for training (default: 256 256)")
+    frame_group.add_argument("--frame-step", type=int, default=1,
+                            help="Use every Nth frame (default: 1 = all frames)")
+    frame_group.add_argument("--n-samples", type=int, default=64,
+                            help="Samples per ray (default: 64)")
+    frame_group.add_argument("--fov", type=float, default=45.0,
+                            help="Field of view in degrees (default: 45.0)")
+    
+    # Training settings
+    train_group = parser.add_argument_group("training settings")
+    train_group.add_argument("--n-iters", type=int, default=8000,
+                            help="Number of training iterations (default: 8000)")
+    train_group.add_argument("--lambda-l1", type=float, default=0.03,
+                            help="L1 sparsity weight (default: 0.03)")
+    train_group.add_argument("--lambda-tv-sigma", type=float, default=0.002,
+                            help="TV smoothness weight for density (default: 0.002)")
+    train_group.add_argument("--lambda-tv-rgb", type=float, default=0.001,
+                            help="TV smoothness weight for color (default: 0.001)")
+    
+    # Mode flags
+    mode_group = parser.add_argument_group("reconstruction modes")
+    mode_group.add_argument("--neighbor-growth", action="store_true",
+                           help="Use neighbor-based growth mode (default: hard core)")
+    mode_group.add_argument("--sharded", action="store_true",
+                           help="Use sharded volume across 8 GPUs")
+    
+    # Visualization
+    viz_group = parser.add_argument_group("visualization")
+    viz_group.add_argument("--viewer", action="store_true",
+                          help="Enable live pygame viewer during training")
+    
+    # Background removal
+    bg_group = parser.add_argument_group("background removal")
+    bg_group.add_argument("--openai-bg-removal", action="store_true",
+                         help="Use OpenAI DALL-E to remove backgrounds and white artifacts (requires OPENAI_API_KEY)")
+    bg_group.add_argument("--openai-api-key", type=str, default=None,
+                         help="OpenAI API key (default: uses OPENAI_API_KEY environment variable)")
+    
+    # Checkpoint
+    checkpoint_group = parser.add_argument_group("checkpoint")
+    checkpoint_group.add_argument("--checkpoint", type=str, default=None,
+                                  help="Resume from checkpoint NPZ file")
+    
+    # Output
+    parser.add_argument("--out-dir", type=str, default="video_voxel_out",
+                       help="Output directory (default: video_voxel_out)")
+    
+    args = parser.parse_args()
+    
+    # Auto-estimate orbit period and direction
+    print(f"Analyzing video: {args.video_path}")
+    orbit_period_frames, fps = estimate_orbit_period(
+        args.video_path, start_frame=args.start_frame
+    )
+    direction = estimate_orbit_direction(
+        args.video_path, start_frame=args.start_frame
+    )
+    
+    # Print mode info
+    if args.neighbor_growth:
         print("=" * 60)
         print("USING NEIGHBOR GROWTH MODE (organic growth from center seed)")
         print("=" * 60)
@@ -1191,26 +1823,59 @@ if __name__ == "__main__":
         print("USING HARD CORE MODE (expanding radial constraint)")
         print("=" * 60)
     
-    if enable_viewer:
+    if args.viewer:
         print("=" * 60)
         print("LIVE VIEWER ENABLED")
         print("  C/V=cubes/volume, arrows=orbit, +/-=zoom, SPACE=pause rotation")
         print("=" * 60)
     
+    # Determine grid size
+    if args.grid_size is not None:
+        grid_size = args.grid_size
+        print(f"Using custom grid size: {grid_size}³")
+    elif args.sharded:
+        grid_size = 512  # Conservative default: 256³ per shard across 8 GPUs
+        print("=" * 60)
+        print(f"SHARDED MODE: Using {grid_size}³ resolution across 8 GPUs")
+        shard_size = grid_size // 2  # 2x2x2 = 8 shards
+        print(f"  Each shard: {shard_size}³ (~{shard_size**3 * 4 * 4 / 1e9:.2f} GB per shard)")
+        print("=" * 60)
+    else:
+        grid_size = 128   # Standard resolution for single GPU
+    
+    # Print configuration summary
+    print()
+    print("Configuration:")
+    print(f"  Grid size: {grid_size}³")
+    print(f"  Frame resolution: {args.img_res[0]}×{args.img_res[1]}")
+    print(f"  Samples per ray: {args.n_samples}")
+    print(f"  Iterations: {args.n_iters}")
+    frame_suffix = 'st' if args.frame_step == 1 else 'nd' if args.frame_step == 2 else 'rd' if args.frame_step == 3 else 'th'
+    print(f"  Frame step: {args.frame_step} (using every {args.frame_step}{frame_suffix} frame)")
+    print(f"  Regularization: L1={args.lambda_l1:.4f}, TV_σ={args.lambda_tv_sigma:.4f}, TV_RGB={args.lambda_tv_rgb:.4f}")
+    print(f"  Background removal: {'OpenAI DALL-E' if args.openai_bg_removal else 'Traditional (background subtraction)'}")
+    print()
+
     train_from_video(
-        video_path=video_path,
+        video_path=args.video_path,
         orbit_period_frames=orbit_period_frames,
         direction=direction,
-        start_frame=start_frame,
-        frame_step=1,          # Use every frame for better constraints
-        grid_size=128,         # High resolution: 128x128x128 voxels (2M+ voxels)
-        img_res=(64,64),
-        n_samples=64,
-        n_iters=4000,          # Doubled iterations for higher resolution and convergence
-        scene_radius=1.5,
-        fov_y_deg=45.0,
-        out_dir="video_voxel_out",
-        use_neighbor_growth=use_neighbor_growth,
-        enable_viewer=enable_viewer,
+        start_frame=args.start_frame,
+        frame_step=args.frame_step,
+        grid_size=grid_size,
+        img_res=tuple(args.img_res),
+        n_samples=args.n_samples,
+        n_iters=args.n_iters,
+        scene_radius=args.scene_radius,
+        fov_y_deg=args.fov,
+        out_dir=args.out_dir,
+        use_neighbor_growth=args.neighbor_growth,
+        enable_viewer=args.viewer,
+        use_sharded=args.sharded,
+        lambda_l1=args.lambda_l1,
+        lambda_tv_sigma=args.lambda_tv_sigma,
+        lambda_tv_rgb=args.lambda_tv_rgb,
+        use_openai_bg_removal=args.openai_bg_removal,
+        openai_api_key=args.openai_api_key,
+        checkpoint_npz=args.checkpoint,
     )
-

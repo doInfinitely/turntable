@@ -1,0 +1,38 @@
+{
+  "input": {
+    "type": "video",
+    "path": "video.mp4"
+  },
+  "output": "final_volume.npz",
+  "steps": [
+    {
+      "type": "reconstruct",
+      "params": {
+        "start_frame": 0,
+        "grid_size": 64,
+        "n_iters": 8000,
+        "img_res": [
+          256,
+          256
+        ],
+        "lambda_l1": 0.03,
+        "lambda_tv_sigma": 0.002,
+        "lambda_tv_rgb": 0.001
+      }
+    },
+    {
+      "type": "subdivide",
+      "params": {
+        "subdivision": 2
+      }
+    },
+    {
+      "type": "harden",
+      "params": {
+        "n_iters": 1000,
+        "variance_penalty": 0.1,
+        "flow_lr": 0.01
+      }
+    }
+  ]
+}

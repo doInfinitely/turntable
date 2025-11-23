@@ -1,0 +1,31 @@
+{
+  "input": {
+    "type": "video_with_checkpoint",
+    "video_path": "hailuo_orbit.mp4",
+    "checkpoint_path": "video_voxel_out/recon_volume.npz"
+  },
+  "output": "refined_and_hardened.npz",
+  "steps": [
+    {
+      "type": "reconstruct",
+      "params": {
+        "n_iters": 4000,
+        "img_res": [256, 256]
+      }
+    },
+    {
+      "type": "subdivide",
+      "params": {
+        "subdivision": 2
+      }
+    },
+    {
+      "type": "harden",
+      "params": {
+        "n_iters": 1500,
+        "variance_penalty": 0.2
+      }
+    }
+  ]
+}
+

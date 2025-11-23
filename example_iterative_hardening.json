@@ -1,0 +1,52 @@
+{
+  "input": {
+    "type": "video",
+    "path": "hailuo_orbit.mp4"
+  },
+  "output": "super_hardened_volume.npz",
+  "steps": [
+    {
+      "type": "reconstruct",
+      "params": {
+        "start_frame": 0,
+        "grid_size": 64,
+        "n_iters": 8000,
+        "img_res": [256, 256]
+      }
+    },
+    {
+      "type": "harden",
+      "params": {
+        "n_iters": 500,
+        "variance_penalty": 0.1
+      }
+    },
+    {
+      "type": "subdivide",
+      "params": {
+        "subdivision": 2
+      }
+    },
+    {
+      "type": "harden",
+      "params": {
+        "n_iters": 1000,
+        "variance_penalty": 0.2
+      }
+    },
+    {
+      "type": "subdivide",
+      "params": {
+        "subdivision": 2
+      }
+    },
+    {
+      "type": "harden",
+      "params": {
+        "n_iters": 1500,
+        "variance_penalty": 0.3
+      }
+    }
+  ]
+}
+

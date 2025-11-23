@@ -8,6 +8,7 @@
 #   +/-          - zoom in/out
 #   V            - volumetric mode
 #   C            - cube mode
+#   Click buttons - change background (black/gray/white)
 #   ESC / close  - quit
 
 import sys
@@ -150,10 +151,14 @@ def render_view_volume(sigma, rgb, eye, target,
                        fov_y_deg=45.0,
                        scene_radius=1.5,
                        n_samples=64,
-                       device="cpu"):
+                       device="cpu",
+                       bg_color=(0, 0, 0)):
     """
     Volumetric rendering: same as training.
     Returns [3,H,W] torch in [0,1]
+    
+    Args:
+        bg_color: Background color as (R, G, B) tuple in [0, 255]
     """
     H, W = img_size
     K = make_intrinsics(H, W, fov_y_deg=fov_y_deg, device=device)
@@ -166,7 +171,21 @@ def render_view_volume(sigma, rgb, eye, target,
                         device=device)
     sigma_s, rgb_s = sample_volume(sigma, rgb, pts, scene_radius=scene_radius)
     rgb_img = volume_render(sigma_s, rgb_s, n_samples)  # [1,3,H,W]
-    return rgb_img[0]  # [3,H,W]
+    
+    # Add background color
+    # Compute accumulated alpha along each ray
+    delta = 1.0 / n_samples
+    alpha = 1.0 - torch.exp(-sigma_s * delta)
+    alpha_shifted = torch.cat([torch.zeros_like(alpha[:, :1]), alpha[:, :-1]], dim=1)
+    T_final = torch.cumprod(1.0 - alpha_shifted + 1e-10, dim=1)[:, -1:, :, :]  # [1,1,H,W]
+    transmittance = T_final.squeeze(1)  # [1,H,W]
+    
+    # Blend with background color
+    bg_color_tensor = torch.tensor(bg_color, dtype=torch.float32, device=device) / 255.0
+    bg_color_tensor = bg_color_tensor.view(3, 1, 1)  # [3,1,1]
+    
+    result = rgb_img[0] + transmittance[0] * bg_color_tensor  # [3,H,W]
+    return result
 
 
 # ---------- Cube renderer (Minecraft-style with actual cube faces) ----------
@@ -231,13 +250,15 @@ def render_view_cubes(sigma_np, rgb_np, eye, target,
                       img_size=(128, 128),
                       fov_y_deg=45.0,
                       scene_radius=1.5,
-                      thresh_factor=0.3):
+                      thresh_factor=0.3,
+                      bg_color=(0, 0, 0)):
     """
     Minecraft-style cube voxel renderer with actual cube faces.
     
     sigma_np: [D,H,W]
     rgb_np:   [D,H,W,3] in [0,1]
     eye, target: np arrays (3,)
+    bg_color: Background color as (R, G, B) tuple in [0, 255]
     Returns: uint8 image [H,W,3]
     """
     H_img, W_img = img_size
@@ -307,7 +328,7 @@ def render_view_cubes(sigma_np, rgb_np, eye, target,
 
     # Create depth buffer and color buffer
     z_buffer = np.full((H_img, W_img), np.inf, dtype=np.float32)
-    img = np.zeros((H_img, W_img, 3), dtype=np.uint8)
+    img = np.full((H_img, W_img, 3), bg_color, dtype=np.uint8)
 
     # Render each voxel as a cube
     for idx in idxs:
@@ -399,6 +420,22 @@ def main(npz_path):
     n_samples = 64
 
     mode = "volume"  # or "cubes"
+    bg_color = (0, 0, 0)  # Default: black background
+    
+    # Button setup
+    button_width = 60
+    button_height = 30
+    button_margin = 10
+    button_y = 10
+    
+    # Button positions (top-left area)
+    button_black = pygame.Rect(button_margin, button_y, button_width, button_height)
+    button_gray = pygame.Rect(button_margin + button_width + 5, button_y, button_width, button_height)
+    button_white = pygame.Rect(button_margin + 2 * (button_width + 5), button_y, button_width, button_height)
+    
+    # Font for button labels
+    pygame.font.init()
+    button_font = pygame.font.Font(None, 20)
 
     running = True
     while running:
@@ -416,6 +453,19 @@ def main(npz_path):
                 elif event.key == pygame.K_c:
                     mode = "cubes"
                     pygame.display.setcaption("Voxel Volume Viewer (mode: cubes)")
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # Left click
+                    mouse_pos = event.pos
+                    # Check button clicks
+                    if button_black.collidepoint(mouse_pos):
+                        bg_color = (0, 0, 0)
+                        print("Background: Black")
+                    elif button_gray.collidepoint(mouse_pos):
+                        bg_color = (128, 128, 128)
+                        print("Background: Gray")
+                    elif button_white.collidepoint(mouse_pos):
+                        bg_color = (255, 255, 255)
+                        print("Background: White")
 
         keys = pygame.key.get_pressed()
 
@@ -451,6 +501,7 @@ def main(npz_path):
                     scene_radius=scene_radius,
                     n_samples=n_samples,
                     device=device,
+                    bg_color=bg_color,
                 )  # [3,H,W]
             img_np = img_t.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             img_np = (img_np * 255).astype(np.uint8)
@@ -461,6 +512,7 @@ def main(npz_path):
                 fov_y_deg=fov_y_deg,
                 scene_radius=scene_radius,
                 thresh_factor=0.3,
+                bg_color=bg_color,
             )
 
         # Convert to Surface and scale to window
@@ -468,6 +520,36 @@ def main(npz_path):
         surf = pygame.transform.smoothscale(surf, (win_size, win_size))
 
         screen.blit(surf, (0, 0))
+        
+        # Draw background color buttons
+        # Button backgrounds
+        pygame.draw.rect(screen, (0, 0, 0), button_black)
+        pygame.draw.rect(screen, (128, 128, 128), button_gray)
+        pygame.draw.rect(screen, (255, 255, 255), button_white)
+        
+        # Button borders (highlight selected)
+        border_color = (255, 255, 0) if bg_color == (0, 0, 0) else (100, 100, 100)
+        pygame.draw.rect(screen, border_color, button_black, 3)
+        
+        border_color = (255, 255, 0) if bg_color == (128, 128, 128) else (100, 100, 100)
+        pygame.draw.rect(screen, border_color, button_gray, 3)
+        
+        border_color = (255, 255, 0) if bg_color == (255, 255, 255) else (100, 100, 100)
+        pygame.draw.rect(screen, border_color, button_white, 3)
+        
+        # Button labels
+        label_black = button_font.render("Black", True, (255, 255, 255))
+        label_gray = button_font.render("Gray", True, (0, 0, 0))
+        label_white = button_font.render("White", True, (0, 0, 0))
+        
+        # Center labels on buttons
+        screen.blit(label_black, (button_black.centerx - label_black.get_width() // 2,
+                                   button_black.centery - label_black.get_height() // 2))
+        screen.blit(label_gray, (button_gray.centerx - label_gray.get_width() // 2,
+                                  button_gray.centery - label_gray.get_height() // 2))
+        screen.blit(label_white, (button_white.centerx - label_white.get_width() // 2,
+                                   button_white.centery - label_white.get_height() // 2))
+        
         pygame.display.flip()
 
     pygame.quit()
