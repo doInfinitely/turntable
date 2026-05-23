@@ -236,13 +236,15 @@ def sample_volume_sharded(sharded_vol, pts_world, scene_radius=1.5):
     return sigma_samples, rgb_samples
 
 
-def volume_render(sigma_samples, rgb_samples, n_samples):
+def volume_render(sigma_samples, rgb_samples, n_samples,
+                  return_depth=False, near=0.1, far=5.0):
     """
     NeRF-style compositing.
     sigma_samples: [1,S,H,W]
     rgb_samples:   [1,S,H,W,3]
     Returns:
       rgb_out: [1,3,H,W]
+      (optional) depth_out: [1,H,W] expected ray distance
     """
     delta = 1.0 / n_samples
     alpha = 1.0 - torch.exp(-sigma_samples * delta)   # [1,S,H,W]
@@ -255,7 +257,13 @@ def volume_render(sigma_samples, rgb_samples, n_samples):
     weights = T * alpha
     rgb_out = (weights.unsqueeze(-1) * rgb_samples).sum(dim=1)  # [1,H,W,3]
     rgb_out = rgb_out.permute(0, 3, 1, 2)                      # [1,3,H,W]
-    return rgb_out
+    if not return_depth:
+        return rgb_out
+    S = sigma_samples.shape[1]
+    ts = torch.linspace(near, far, S, device=sigma_samples.device)
+    ts = ts.view(1, S, 1, 1)
+    depth_out = (weights * ts).sum(dim=1)                      # [1,H,W]
+    return rgb_out, depth_out
 
 
 def render_volume(sigma, rgb, K, poses, img_size=(64, 64),
@@ -274,6 +282,24 @@ def render_volume(sigma, rgb, K, poses, img_size=(64, 64),
         rgb_img = volume_render(sigma_s, rgb_s, n_samples)  # [1,3,H,W]
         images.append(rgb_img[0])
     return images
+
+
+def render_volume_with_depth(sigma, rgb, K, poses, img_size=(64, 64),
+                             n_samples=64, scene_radius=1.5, device="cpu",
+                             near=0.1, far=5.0):
+    """Render volume returning both RGB and expected ray-depth per view."""
+    H, W = img_size
+    images, depths = [], []
+    for (R, t) in poses:
+        pts = generate_rays(H, W, K, R, t, n_samples=n_samples,
+                            near=near, far=far, device=device)
+        sigma_s, rgb_s = sample_volume(sigma, rgb, pts, scene_radius=scene_radius)
+        rgb_img, depth_img = volume_render(sigma_s, rgb_s, n_samples,
+                                           return_depth=True,
+                                           near=near, far=far)
+        images.append(rgb_img[0])
+        depths.append(depth_img[0])
+    return images, depths
 
 
 def render_volume_sharded(sharded_vol, K, poses, img_size=(64, 64),
@@ -1128,6 +1154,11 @@ def train_from_video(
     use_openai_bg_removal=False,  # Use OpenAI to remove backgrounds
     openai_api_key=None,     # OpenAI API key (or use OPENAI_API_KEY env var)
     checkpoint_npz=None,     # Optional: path to checkpoint NPZ to resume from
+    use_depth_anything=False,
+    lambda_depth=0.5,
+    lambda_freespace=0.5,
+    depth_anything_model="depth-anything/Depth-Anything-V2-Small-hf",
+    reference_height=None,
 ):
 
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -1190,6 +1221,135 @@ def train_from_video(
         device=device,
         theta0=0.0,
     )
+
+    # 3.5) DepthAnything supervision setup
+    da_targets = None         # tensor [V, H, W] of per-pixel target depth in world units
+    da_masks = None           # tensor [V, H, W] in {0, 1}
+    free_space_mask_3d = None # [1, 1, D, H, W] of voxels that should be empty
+    if use_depth_anything:
+        from depth_anything import DepthAnythingEstimator
+        print("[DepthAnything] Loading model...")
+        da = DepthAnythingEstimator(model_id=depth_anything_model)
+        # Compute per-view depth in pipeline units (1 = scene centre).
+        # Convert to world depth from camera using a fixed orbit radius
+        # (same convention as build_orbit_poses_from_period).
+        cam_radius = 2.5
+        # Re-read frames at full resolution to feed DepthAnything, then
+        # resize the resulting depth map to (H, W).
+        # Use the trainer's foreground mask (already loaded above) so we
+        # never feed DepthAnything's nonsense outputs on the white
+        # background into the loss.
+        fg_mask_np = mask_stack.squeeze(1).cpu().numpy()  # [V, H, W] in {0,1}
+
+        # Per-frame orbit camera distance: if a reference height is
+        # supplied, recover it via pinhole geometry from the foreground
+        # bbox height in pixels.  Otherwise fall back to the orbit
+        # radius assumed by build_orbit_poses_from_period.
+        focal_y_px = float(K[1, 1].cpu().numpy())
+        per_frame_cam_radius = []
+        if reference_height is not None:
+            for vi in range(len(used_indices)):
+                fg = fg_mask_np[vi] > 0.5
+                ys, xs = np.nonzero(fg)
+                if len(ys) < 10:
+                    per_frame_cam_radius.append(2.5)  # fallback
+                    continue
+                bbox_h_px = float(ys.max() - ys.min())
+                if bbox_h_px <= 0:
+                    per_frame_cam_radius.append(2.5)
+                    continue
+                # Pinhole: bbox_h_px / focal_y_px = reference_height / depth
+                d = focal_y_px * reference_height / bbox_h_px
+                per_frame_cam_radius.append(float(d))
+            mean_d = float(np.mean(per_frame_cam_radius))
+            print(f"[DepthAnything] Reference-height calibration: "
+                  f"mean recovered cam-distance = {mean_d:.3f} m "
+                  f"(per-frame std = {float(np.std(per_frame_cam_radius)):.3f})")
+            cam_radius = mean_d  # also used for the freespace mask
+        else:
+            per_frame_cam_radius = [2.5] * len(used_indices)
+
+        cap = cv2.VideoCapture(video_path)
+        depth_targets_np = []
+        depth_masks_np = []
+        for vi, fi in enumerate(used_indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, frame_bgr = cap.read()
+            if not ok:
+                depth_targets_np.append(np.ones((H, W), dtype=np.float32) * cam_radius)
+                depth_masks_np.append(np.zeros((H, W), dtype=np.float32))
+                continue
+            d_rel = da.estimate(frame_bgr)                          # (h, w)
+            d_rel_resized = cv2.resize(d_rel, (W, H), interpolation=cv2.INTER_LINEAR)
+
+            # Renormalise using only foreground pixels so the white
+            # background outliers don't blow up the depth map's range.
+            fg = fg_mask_np[vi] > 0.5
+            if fg.sum() > 0:
+                lo, hi = np.percentile(d_rel_resized[fg], [2, 98])
+                d_rel_resized = np.clip(d_rel_resized, lo, hi)
+                # Re-anchor to "1.0 = median of foreground"
+                med = float(np.median(d_rel_resized[fg]))
+                if med > 1e-6:
+                    d_rel_resized = d_rel_resized / med
+
+            # Per-frame camera distance from reference-height calibration
+            # (or the fallback orbit radius if not supplied)
+            cam_d = per_frame_cam_radius[vi]
+            d_world = cam_d - (d_rel_resized - 1.0) * cam_d
+
+            # Mask out non-foreground AND any extreme depth values
+            valid = fg & (d_rel_resized > 0.3) & (d_rel_resized < 2.5)
+            depth_targets_np.append(d_world.astype(np.float32))
+            depth_masks_np.append(valid.astype(np.float32))
+        cap.release()
+        da_targets = torch.from_numpy(np.stack(depth_targets_np)).to(device)  # [V, H, W]
+        da_masks = torch.from_numpy(np.stack(depth_masks_np)).to(device)
+        n_valid = int(da_masks.sum().item())
+        n_total = da_masks.numel()
+        print(f"[DepthAnything] Computed {len(used_indices)} depth maps "
+              f"(world-distance range [{da_targets.min().item():.2f}, {da_targets.max().item():.2f}] m, "
+              f"valid pixels: {n_valid}/{n_total} = {100.0*n_valid/n_total:.1f}%)")
+
+        # Build a global 3D free-space mask: voxels that are CLOSER to
+        # any view's camera than that view's depth target says the
+        # surface is.
+        if lambda_freespace > 0:
+            margin = 0.05
+            gs = grid_size
+            coords = np.linspace(-scene_radius, scene_radius, gs).astype(np.float32)
+            zw, yw, xw = np.meshgrid(coords, coords, coords, indexing='ij')
+            pts_world = np.stack([xw, yw, zw], axis=-1).reshape(-1, 3).T  # [3, N]
+            free_acc = np.zeros(gs * gs * gs, dtype=np.float32)
+            K_np = K.cpu().numpy()
+            for vi, (Rt, tt) in enumerate(poses):
+                R_np = Rt.cpu().numpy()
+                t_np = tt.cpu().numpy().reshape(3)
+                pts_cam = R_np @ pts_world + t_np[:, None]   # [3, N]
+                cam_z = pts_cam[2]
+                in_front = cam_z > 0.05
+                pix = K_np @ pts_cam
+                u = pix[0] / np.maximum(pix[2], 1e-6)
+                v = pix[1] / np.maximum(pix[2], 1e-6)
+                ui = np.clip(np.round(u).astype(np.int64), 0, W - 1)
+                vi_p = np.clip(np.round(v).astype(np.int64), 0, H - 1)
+                d_target = depth_targets_np[vi][vi_p, ui]
+                # d_mask combines (a) the trainer's foreground mask
+                # and (b) sane-depth-range filter, so background-pixel
+                # projections are skipped entirely.
+                d_mask = depth_masks_np[vi][vi_p, ui]
+                in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                is_free = (cam_z < (d_target - margin)) & in_front & in_image & (d_mask > 0.5)
+                free_acc += is_free.astype(np.float32)
+            free_mask_np = (free_acc >= 1.0).reshape(gs, gs, gs).astype(np.float32)
+            free_space_mask_3d = (
+                torch.from_numpy(free_mask_np)
+                .to(device)
+                .unsqueeze(0).unsqueeze(0)
+            )
+            n_free = int(free_mask_np.sum())
+            print(f"[DepthAnything] Free-space mask covers "
+                  f"{n_free}/{gs**3} voxels ({100.0*n_free/gs**3:.1f}%)")
 
     # 4) Load checkpoint if provided
     checkpoint_data = None
@@ -1447,14 +1607,24 @@ def train_from_video(
                 n_gpus=n_gpus,
             )  # list of V [3,H,W]
         else:
-            # Single-GPU rendering
-            pred_images = render_volume(
-                sigma_rec, rgb_rec, K, poses,
-                img_size=img_res,
-                n_samples=n_samples,
-                scene_radius=scene_radius,
-                device=device,
-            )  # list of V [3,H,W]
+            # Single-GPU rendering (optionally with depth for DA supervision)
+            if use_depth_anything:
+                pred_images, pred_depths = render_volume_with_depth(
+                    sigma_rec, rgb_rec, K, poses,
+                    img_size=img_res,
+                    n_samples=n_samples,
+                    scene_radius=scene_radius,
+                    device=device,
+                )
+            else:
+                pred_images = render_volume(
+                    sigma_rec, rgb_rec, K, poses,
+                    img_size=img_res,
+                    n_samples=n_samples,
+                    scene_radius=scene_radius,
+                    device=device,
+                )  # list of V [3,H,W]
+                pred_depths = None
 
         t_render = time.time() - t0
 
@@ -1496,6 +1666,20 @@ def train_from_video(
 
         loss = loss_mse + loss_tv + lambda_l1 * loss_l1
 
+        # DepthAnything supervision: per-view L1 depth + global free-space penalty
+        loss_depth = torch.tensor(0.0, device=device)
+        loss_free = torch.tensor(0.0, device=device)
+        if use_depth_anything and pred_depths is not None and lambda_depth > 0:
+            depth_stack = torch.stack(pred_depths, dim=0)            # [V, H, W]
+            depth_diff = (depth_stack - da_targets).abs() * da_masks
+            loss_depth = depth_diff.sum() / (da_masks.sum() + 1e-6)
+            loss = loss + lambda_depth * loss_depth
+        if (use_depth_anything and free_space_mask_3d is not None
+                and lambda_freespace > 0):
+            loss_free = (sigma_rec * free_space_mask_3d).sum() / (
+                free_space_mask_3d.sum() + 1e-6)
+            loss = loss + lambda_freespace * loss_free
+
         t1 = time.time()
         opt.zero_grad()
         loss.backward()
@@ -1503,9 +1687,12 @@ def train_from_video(
         t_backward = time.time() - t1
 
         if it % 10 == 0 or it == 0:
+            extras = ""
+            if use_depth_anything:
+                extras = f", d={loss_depth.item():.3e}, free={loss_free.item():.3e}"
             print(
                 f"[{it}/{n_iters}] loss={loss.item():.6e} "
-                f"(mse={loss_mse.item():.6e}, tv={loss_tv.item():.6e}, l1={loss_l1.item():.6e}, {info_str}) "
+                f"(mse={loss_mse.item():.6e}, tv={loss_tv.item():.6e}, l1={loss_l1.item():.6e}{extras}, {info_str}) "
                 f"[render={t_render:.3f}s, backward={t_backward:.3f}s]"
             )
 
@@ -1797,6 +1984,27 @@ Examples:
     checkpoint_group = parser.add_argument_group("checkpoint")
     checkpoint_group.add_argument("--checkpoint", type=str, default=None,
                                   help="Resume from checkpoint NPZ file")
+
+    # DepthAnything supervision
+    da_group = parser.add_argument_group("DepthAnything supervision")
+    da_group.add_argument("--use-depth-anything", action="store_true",
+                         help="Use monocular DepthAnything depth as a per-view "
+                              "supervision signal for the voxel volume")
+    da_group.add_argument("--lambda-depth", type=float, default=0.5,
+                         help="Weight on the L1 depth loss (default: 0.5)")
+    da_group.add_argument("--lambda-freespace", type=float, default=0.5,
+                         help="Weight on the global free-space penalty "
+                              "(density at voxels in front of the surface "
+                              "implied by the depth map). Default: 0.5")
+    da_group.add_argument("--depth-anything-model", type=str,
+                         default="depth-anything/Depth-Anything-V2-Small-hf",
+                         help="HuggingFace DepthAnything checkpoint id")
+    da_group.add_argument("--reference-height", type=float, default=None,
+                         help="Known world-height of the subject (e.g. 1.5 "
+                              "for a humanoid). When set, the orbit camera "
+                              "distance is recovered per-frame via "
+                              "depth = focal * height / bbox_height_px, "
+                              "replacing the hardcoded cam_radius=2.5 fudge.")
     
     # Output
     parser.add_argument("--out-dir", type=str, default="video_voxel_out",
@@ -1878,4 +2086,9 @@ Examples:
         use_openai_bg_removal=args.openai_bg_removal,
         openai_api_key=args.openai_api_key,
         checkpoint_npz=args.checkpoint,
+        use_depth_anything=args.use_depth_anything,
+        lambda_depth=args.lambda_depth,
+        lambda_freespace=args.lambda_freespace,
+        depth_anything_model=args.depth_anything_model,
+        reference_height=args.reference_height,
     )
